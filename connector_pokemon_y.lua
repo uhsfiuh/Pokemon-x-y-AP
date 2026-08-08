@@ -1,6 +1,6 @@
 -- ============================================================================
 -- Pokémon Y BizHawk Connector for Archipelago
--- Location: z:\Users\crazy\OneDrive\Desktop\code\POKEMONXYAP\pokemon_y_connector.lua
+-- 
 -- ============================================================================
 
 local socket = nil
