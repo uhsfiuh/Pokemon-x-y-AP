@@ -1,6 +1,6 @@
 -- ============================================================================
--- Pokémon X & Y Archipelago BizHawk Connector (Vanilla Item Interceptor Build)
--- Location: Z:\ProgramData\Archipelago\data\lua\pokemon_y_connector.lua
+-- Pokémon X Archipelago BizHawk Connector (Vanilla Item Interceptor Build)
+-- Location: Z:\ProgramData\Archipelago\data\lua\pokemon_x_connector.lua
 -- Memory Domain: mainmemory (0x074... addresses)
 -- ============================================================================
 
@@ -1257,7 +1257,7 @@ local request_handlers = {
         return {type = "SYSTEM_RESPONSE", value = sys}
     end,
     ["HASH"] = function(req)
-        local h = "POKEMON_Y"
+        local h = "POKEMON_X"
         if gameinfo and gameinfo.getromhash then
             h = gameinfo.getromhash()
         end
@@ -1333,7 +1333,7 @@ for i = 0, MONITORED_BYTES - 1 do
 end
 
 print("==============================================")
-print(" Pokémon X/Y Archipelago Connector Active")
+print(" Pokémon X Archipelago Connector Active")
 print(" Memory Domain: mainmemory")
 print(" Interceptor: AUTO-REMOVE VANILLA ITEMS")
 print(" Status: LISTENING FOR CLIENT ON PORT 43055")
@@ -1464,7 +1464,7 @@ while true do
     end
 
     -- On-Screen Status Display
-    gui.drawText(5, 5, "=== Pokémon X/Y Archipelago Connector ===", "yellow", "black", 12)
+    gui.drawText(5, 5, "=== Pokémon X Archipelago Connector ===", "yellow", "black", 12)
     gui.drawText(5, 21, client and "Status: CONNECTED TO CLIENT" or "Status: LISTENING ON PORT 43055", client and "lime" or "yellow", "black", 11)
     if hold_ap_items then
         gui.drawText(5, 37, string.format("HOLD: Intercepting Vanilla Item (%d left)...", pending_vanilla_removals), "orange", "black", 11)
