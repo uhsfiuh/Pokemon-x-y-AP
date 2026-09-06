@@ -31,8 +31,11 @@ i imagine it might be weird if you have collection upon completion turned on for
 Some checks that are unreasonable to do mightve slipped through into logic so tell me any you encounter
 
 Game version i imagine shouldnt matter, i believe i have just been using the base US version of Y
-I have not tested with pokemon x at all
+
+Universal Tracker should work, report any problems with it i will try to fix them
 
 If you do run into an issue tell me and i did implement a way to manually send items/locations so at least your run shouldnt be dead, will try to find the best way to share that, but you need all the item/location ids
+
+Any bugs or anything you run into, feel free to dm me, i am more likely to see it than in the pokemon x/y chat, but probably put it in both so more people cann see the problem and solution
 
 Bizhawk sometimes frezzes, you may disconnect temporarily from archipelago but should be fine, hopefully
