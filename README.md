@@ -44,3 +44,4 @@ Bizhawk sometimes frezzes, you may disconnect temporarily from archipelago but s
 # AI DISCLOSURE
 
 I have said since i started this that i do not know how to code, so i have done research, dug in the ram, done what i do know how to do, but the code is almost exclusively written by ai in both the world and the connectors, i have tested that it works, and i have ran the tests provided by archipelago, and i am ready to keep working to solve any bugs that show up, if anybody ever wants to take this over so it is no longer ai coded, feel free, i only am using ai because i want to play this and nobody was anywhere near starting working on this, ever, except for when i did this, will shout out the people who provided help for me on where to look and what to try doing, as well as the people that provided useful info to further this project, can add your names if you want just reach out
+Currently using the latest version of Gemini in antigravity
