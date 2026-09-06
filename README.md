@@ -3,6 +3,7 @@ my implementation for pokemon x/y archipelago
 
 # Player Installation Steps
 Drop APWorld: Copy pokemon_x_and_y.apworld into %ProgramData%\Archipelago\custom_worlds\ or you should be able to just run it maybe
+
 Put the Pokemon_y_connector in your Archipelago\data\lua\ folder, might not be necessary but to be safe
 
 Generate Seed: Use Pokemon X and Y.yaml in the Players/ folder and run ArchipelagoGenerate.exe.
