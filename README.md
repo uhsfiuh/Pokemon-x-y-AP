@@ -4,14 +4,14 @@ my implementation for pokemon x/y archipelago
 # Player Installation Steps
 Drop APWorld: Copy pokemon_x_and_y.apworld into %ProgramData%\Archipelago\custom_worlds\ or you should be able to just run it maybe
 
-Put the Pokemon_y_connector in your Archipelago\data\lua\ folder, might not be necessary but to be safe
+Put the Pokemon_y_connector/Pokemon_x_connector depend on your game in your Archipelago\data\lua\ folder, might not be necessary but to be safe
 
 Generate Seed: Use Pokemon X and Y.yaml in the Players/ folder and run ArchipelagoGenerate.exe.
 
 # Play:
 Load Pokémon X or Y in BizHawk.
 
-Run connector_pokemon_y.lua in Tools -> Lua Console.
+Run connector_pokemon_y.lua/Pokemon_x_connector, or whatever i called it, in Tools -> Lua Console.
 
 Connect using ArchipelagoBizHawkClient.exe.
 
