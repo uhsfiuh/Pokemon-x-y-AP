@@ -15,7 +15,13 @@ Run connector_pokemon_y.lua/Pokemon_x_connector, or whatever i called it, in Too
 
 Connect using ArchipelagoBizHawkClient.exe.
 
+Added a menu that will pop up when you load the lua script, in this menu there are two parts
 
+1. When you go to fight a gym leader, but you already have their badge, then when you walk up to the leader, hit suppress in the menu and then you can fight them
+
+2. there are some important checks that i couldnt find in the ram (at least not yet) so as a quick fix i added a menu for you to click them off after you collect them, it should remove the original item as well unless archipelago already gave it to you.
+
+3. both sections have cheats incase anything goes wrong, dont cheat, they are just a fall back.
 
 # Known/potential problems:
 
@@ -44,4 +50,3 @@ Bizhawk sometimes frezzes, you may disconnect temporarily from archipelago but s
 # AI DISCLOSURE
 
 I have said since i started this that i do not know how to code, so i have done research, dug in the ram, done what i do know how to do, but the code is almost exclusively written by ai in both the world and the connectors, i have tested that it works, and i have ran the tests provided by archipelago, and i am ready to keep working to solve any bugs that show up, if anybody ever wants to take this over so it is no longer ai coded, feel free, i only am using ai because i want to play this and nobody was anywhere near starting working on this, ever, except for when i did this, will shout out the people who provided help for me on where to look and what to try doing, as well as the people that provided useful info to further this project, can add your names if you want just reach out
-Currently using the latest version of Gemini in antigravity
