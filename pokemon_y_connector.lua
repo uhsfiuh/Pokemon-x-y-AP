@@ -73,7 +73,10 @@ local BADGE_ADDRESS    = 0x074D86A0
 local POCKETS = {
     { addr = 0x074D5554, slots = 100, name = "Items" },
     { addr = 0x074D5B94, slots = 60,  name = "Key Items" },
-    { addr = 0x074D5D14, slots = 110, name = "TM/HM" },
+    -- 106, not 110. Medicine begins at 0x074D5EBC, and 0x074D5D14 + 110*4 =
+    -- 0x074D5ECC -- 4 slots past it. At 110 the interceptor scans, and can
+    -- clear, the first four Medicine slots believing they are TM slots.
+    { addr = 0x074D5D14, slots = 106, name = "TM/HM" },
     { addr = 0x074D5EBC, slots = 60,  name = "Medicine" },
     { addr = 0x074D5FBC, slots = 70,  name = "Berries" },
 }
@@ -82,20 +85,90 @@ local POCKETS = {
 local EVENT_FLAGS_BASE = 0x074E86B8
 local MONITORED_BYTES  = 375  -- 375 bytes * 8 = 3,000 total flags (covers up to 0x0BB8)
 
+-- BizHawk's own `client` API, captured HERE because the socket variable below
+-- is also called `client` and shadows the name for the rest of the file.
+-- Used to detect a paused emulator.
+local emuclient = client
+
 local SERVER_PORT = 43055
 local server = nil
 local client = nil
+
+-- Bulk memory read, with automatic fallback to per-byte reads.
+--
+-- Why this exists: the idle path used to issue roughly 1,975 individual
+-- mainmemory.read_u8 calls EVERY frame (375 event-flag bytes + 1,600 bag
+-- bytes). Each one crosses the Lua/emulator boundary. That is the most likely
+-- cause of the BizHawk stutter and freezing reported by players. Reading each
+-- region in one call takes it to about 6 calls per frame.
+--
+-- It is wrapped defensively because read_bytes_as_array's index base has
+-- differed between BizHawk builds (some 0-based, some 1-based) and it is
+-- missing entirely from very old ones. We probe once, remember the answer, and
+-- permanently fall back to the old per-byte path if anything looks wrong -- so
+-- on a build where the fast path cannot be trusted, behaviour is exactly what
+-- it was before.
+local bulk_read_mode = nil  -- nil = not yet probed, 0/1 = index base, false = unusable
+
+local function read_block(addr, len)
+    if bulk_read_mode == nil then
+        local ok, res = pcall(mainmemory.read_bytes_as_array, addr, len)
+        if ok and type(res) == "table" then
+            if res[0] ~= nil then
+                bulk_read_mode = 0
+            elseif res[1] ~= nil then
+                bulk_read_mode = 1
+            else
+                bulk_read_mode = false
+            end
+        else
+            bulk_read_mode = false
+        end
+        if bulk_read_mode == false then
+            print(">>> Bulk memory reads unavailable on this BizHawk build; using per-byte reads.")
+        else
+            print(string.format(">>> Bulk memory reads enabled (%d-based index).", bulk_read_mode))
+        end
+    end
+
+    local out = {}
+
+    if bulk_read_mode ~= false then
+        local ok, res = pcall(mainmemory.read_bytes_as_array, addr, len)
+        if ok and type(res) == "table" then
+            local base   = bulk_read_mode
+            local ok_all = true
+            for i = 0, len - 1 do
+                local v = res[base + i]
+                if v == nil then ok_all = false end
+                out[i] = v
+            end
+            if ok_all then return out end
+        end
+        -- Unexpected shape: stop trusting the fast path for the rest of the session.
+        bulk_read_mode = false
+        out = {}
+        print(">>> Bulk read returned unexpected data; falling back to per-byte reads.")
+    end
+
+    for i = 0, len - 1 do
+        out[i] = mainmemory.read_u8(addr + i)
+    end
+    return out
+end
 
 -- Bag Snapshot Helper
 local function take_bag_snapshot()
     local snap = {}
     for p_idx, p in ipairs(POCKETS) do
         snap[p_idx] = {}
+        local blk = read_block(p.addr, p.slots * 4)
         for s = 0, p.slots - 1 do
-            local addr = p.addr + (s * 4)
-            local id  = mainmemory.read_u8(addr) + (mainmemory.read_u8(addr + 1) * 256)
-            local cnt = mainmemory.read_u8(addr + 2) + (mainmemory.read_u8(addr + 3) * 256)
-            snap[p_idx][s] = { id = id, cnt = cnt }
+            local o = s * 4
+            snap[p_idx][s] = {
+                id  = blk[o]     + (blk[o + 1] * 256),
+                cnt = blk[o + 2] + (blk[o + 3] * 256),
+            }
         end
     end
     return snap
@@ -108,6 +181,10 @@ local intercept_timer          = 0
 local held_writes              = {}
 local last_bag                 = take_bag_snapshot()
 
+-- Forward declaration. Defined further down with the manual-check helpers, but
+-- needed here so held writes are recorded as Archipelago grants too.
+local note_ap_bag_write
+
 -- Release Held Archipelago Writes
 local function release_held_writes()
     if #held_writes > 0 then
@@ -119,6 +196,7 @@ local function release_held_writes()
                 local val = (type(raw) == "table") and raw[i] or string.byte(raw, i)
                 mainmemory.write_u8(addr + (i - 1), val)
             end
+            if note_ap_bag_write then note_ap_bag_write(addr) end
             print(string.format(">>> [ARCHIPELAGO ITEM DELIVERED] to 0x%08X", addr))
         end
         held_writes = {}
@@ -133,28 +211,34 @@ local ITEM_CHECK_FLAGS = {
     [0x0090] = true, -- Cyllage City - Received Whipped Dream / Sachet from man
     [0x0092] = true, -- Lumiose City (South Boulevard) - Received Luxury Ball (x5) from woman
     [0x0093] = true, -- Shalour City - Received Shoothe Bell from madame for showing her a Pokémon with good friendship
-    [0x0097] = true, -- Shalour City - Received Eviolite from scientist for seeing at least 40 species in Coastal Pokédex
+    -- 0x0097 removed: needs 40 species in the Coastal Pokedex, too grindy.
     [0x00A4] = true, -- Aquacorde Town - Received Potion from shopkeeper
     [0x00AA] = true, -- Coumarine City - Received Poké Toy from woman for answering her sound quiz first time
-    [0x00B1] = true, -- Lumiose City (South Boulevard) - Received TM54 (False Swipe) from female scientist for seeing at least 20 species in Central Kalos Pokédex
+    -- 0x00B1 removed: needs 20 species in the Central Kalos Pokedex, too grindy.
     [0x00B2] = true, -- Camphrier Town - Received Berry Juice from girl
     [0x00B3] = true, -- Camphrier Town - Received Ultra Ball from man
     [0x00B4] = true, -- Camphrier Town - Received Full Heal from boy
     [0x00B5] = true, -- Camphrier Town - Received TM46 (Thief) from punk girl
-    [0x00B7] = true, -- Coumarine City - Received Lucky Egg from woman for showing her a Pokémon with maximum friendship
+    -- 0x00B7 removed: needs maximum friendship, too grindy.
     [0x00C6] = true, -- Lumiose City (South Boulevard) - Received Quick Claw from woman
     [0x00C7] = true, -- Lumiose City (South Boulevard) - Received Quick Ball (x3) from man
-    [0x00D5] = true, -- Ambrette Town - Received the Douse Drive
+    -- 0x00D5 (Douse Drive) removed: Genesect-gated, so it is no longer a check.
+    -- 0x03F5 removed: it is an object-visibility flag that is already set on a
+    -- new save. The Poké Flute is a manual check on 0x0012 instead, and the
+    -- manual button handles removing the vanilla copy itself.
+    -- NOTE: 0x0A55 (Roller Skates) is deliberately NOT listed here. It is a
+    -- capability flag, not a bag item, so there is no vanilla item to strip --
+    -- arming the interceptor for it would just stall for the 10s timeout.
     [0x00D7] = true, -- Santalune Forest - Received Poké Ball from Calem/Serena if interacted
     [0x00FE] = true, -- Lumiose City (South Boulevard) - Received Timer Ball (x3) from man
     [0x00FF] = true, -- Cyllage City - Received Persim Berry (x3) from girl for answering her quiz
     [0x0106] = true, -- Parfum Palace - Received Oran Berry from woman
     [0x0109] = true, -- Ambrette Town - Received TM94 (Rock Smash) from girl
     [0x010B] = true, -- Santalune City - Received Great Ball from boy
-    [0x010D] = true, -- Lumiose City (Vernal Avenue) - Received Pearl String (x2) from madame for showing her a Furfrou that has kept the same trim for 15 days
+    -- 0x010D (Furfrou 15-day trim / Pearl String) removed: impossible/unreasonable to complete.
     [0x010E] = true, -- Tower of Mastery - Received TM47 (Low Sweep) from ace trainer
     [0x011A] = true, -- Coumarine City - Received Good Rod from fisherman
-    [0x011C] = true, -- Reflection Cave - Received Reveal Glass from female scientist for showing her a Tornadus / Thundurus / Landorus
+    -- 0x011C (Reveal Glass / Tornadus-Thundurus-Landorus) removed: impossible/unreasonable to complete.
     [0x011D] = true, -- Azure Bay - Received Ampharosite from old man
     [0x011E] = true, -- Ambrette Town - Received Aerodactylite from male scientist
     [0x0146] = true, -- Shalour City - Exchanged the Intriguing Stone for a Sun Stone with hiker
@@ -261,16 +345,16 @@ local ITEM_CHECK_FLAGS = {
     [0x04A4] = true, -- Frost Cavern - Found Ice Heal (2)
     [0x04A5] = true, -- Frost Cavern - Found Elixir
     [0x04A6] = true, -- Frost Cavern - Found PP Up
-    [0x04A7] = true, -- Route 18 - Found Timer Ball
-    [0x04A8] = true, -- Route 18 - Found Paralyze Heal
+    [0x04A7] = true, -- Route 17 - Found Timer Ball
+    [0x04A8] = true, -- Route 17 - Found Paralyze Heal
     [0x04A9] = true, -- Anistar City - Found Pretty Wing (recurring)
     [0x04AA] = true, -- Anistar City - Found Escape Rope
     [0x04AB] = true, -- Anistar City - Found Super Repel
     [0x04AC] = true, -- Anistar City - Found Sun Stone
-    [0x04AD] = true, -- Route 19 - Found Poké Ball
-    [0x04AE] = true, -- Route 19 - Found Ether
-    [0x04AF] = true, -- Route 19 - Found Honey
-    [0x04B0] = true, -- Route 19 - Found Super Potion
+    [0x04AD] = true, -- Route 18 - Found Poké Ball
+    [0x04AE] = true, -- Route 18 - Found Ether
+    [0x04AF] = true, -- Route 18 - Found Honey
+    [0x04B0] = true, -- Route 18 - Found Super Potion
     [0x04B1] = true, -- Terminus Cave - Found Dusk Ball
     [0x04B2] = true, -- Terminus Cave - Found Hyper Potion
     [0x04B3] = true, -- Terminus Cave - Found Moon Stone
@@ -284,26 +368,26 @@ local ITEM_CHECK_FLAGS = {
     [0x04BB] = true, -- Couriway Town - Found Ether
     [0x04BC] = true, -- Couriway Town - Found Burn Heal
     [0x04BD] = true, -- Couriway Town - Found Prism Scale (recurring)
-    [0x04BE] = true, -- Route 20 - Found Net Ball
-    [0x04BF] = true, -- Route 20 - Found Antidote
-    [0x04C0] = true, -- Route 20 - Found Damp Rock
-    [0x04C1] = true, -- Route 20 - Found Escape Rope
-    [0x04C2] = true, -- Route 20 - Found Timer Ball
+    [0x04BE] = true, -- Route 19 - Found Net Ball
+    [0x04BF] = true, -- Route 19 - Found Antidote
+    [0x04C0] = true, -- Route 19 - Found Damp Rock
+    [0x04C1] = true, -- Route 19 - Found Escape Rope
+    [0x04C2] = true, -- Route 19 - Found Timer Ball
     [0x04C3] = true, -- Snowbelle City - Found Icy Rock
     [0x04C4] = true, -- Snowbelle City - Found X Sp. Atk
     [0x04C5] = true, -- Snowbelle City - Found Full Heal
-    [0x04C6] = true, -- Route 21 - Found Repeat Ball
-    [0x04C7] = true, -- Route 21 - Found Antidote
-    [0x04C8] = true, -- Route 21 - Found Mental Herb
-    [0x04C9] = true, -- Route 21 - Found Tiny Mushroom
-    [0x04CA] = true, -- Route 21 - Found Balm Mushroom
+    [0x04C6] = true, -- Route 20 - Found Repeat Ball
+    [0x04C7] = true, -- Route 20 - Found Antidote
+    [0x04C8] = true, -- Route 20 - Found Mental Herb
+    [0x04C9] = true, -- Route 20 - Found Tiny Mushroom
+    [0x04CA] = true, -- Route 20 - Found Balm Mushroom
     [0x04CB] = true, -- Pokémon Village - Found Honey
     [0x04CC] = true, -- Pokémon Village - Found Pretty Wing
     [0x04CD] = true, -- Pokémon Village - Found Honey (2)
-    [0x04CE] = true, -- Route 22 - Found Guard Spec.
-    [0x04CF] = true, -- Route 22 - Found PP Up
-    [0x04D0] = true, -- Route 22 - Found Pearl String
-    [0x04D1] = true, -- Route 22 - Found Elixir
+    [0x04CE] = true, -- Route 21 - Found Guard Spec.
+    [0x04CF] = true, -- Route 21 - Found PP Up
+    [0x04D0] = true, -- Route 21 - Found Pearl String
+    [0x04D1] = true, -- Route 21 - Found Elixir
     [0x04D2] = true, -- Route 22 - Found Max Elixir
     [0x04D3] = true, -- Route 22 - Found Full Restore
     [0x04D4] = true, -- Victory Road - Found X Attack
@@ -437,13 +521,13 @@ local ITEM_CHECK_FLAGS = {
     [0x058A] = true, -- Frost Cavern - Ether item ball disappeared
     [0x058B] = true, -- Frost Cavern - Zinc item ball disappeared
     [0x058C] = true, -- Frost Cavern - Icy Rock item ball disappeared
-    [0x058D] = true, -- Route 18 - Icicle Plate item ball disappeared
-    [0x058E] = true, -- Route 18 - Calcium item ball disappeared
-    [0x058F] = true, -- Route 18 - Rare Candy item ball disappeared
-    [0x0590] = true, -- Route 19 - Hyper Potion item ball disappeared
-    [0x0591] = true, -- Route 19 - PP Up item ball disappeared
-    [0x0592] = true, -- Route 19 - X Defense item ball disappeared
-    [0x0593] = true, -- Route 19 - Max Ether item ball disappeared
+    [0x058D] = true, -- Route 17 - Icicle Plate item ball disappeared
+    [0x058E] = true, -- Route 17 - Calcium item ball disappeared
+    [0x058F] = true, -- Route 17 - Rare Candy item ball disappeared
+    [0x0590] = true, -- Route 18 - Hyper Potion item ball disappeared
+    [0x0591] = true, -- Route 18 - PP Up item ball disappeared
+    [0x0592] = true, -- Route 18 - X Defense item ball disappeared
+    [0x0593] = true, -- Route 18 - Max Ether item ball disappeared
     [0x0594] = true, -- Terminus Cave - Star Piece item ball disappeared
     [0x0595] = true, -- Terminus Cave - Heat Rock item ball disappeared
     [0x0596] = true, -- Terminus Cave - Escape Rope item ball disappeared
@@ -457,17 +541,17 @@ local ITEM_CHECK_FLAGS = {
     [0x059E] = true, -- Terminus Cave - Griseous Orb item ball disappeared
     [0x059F] = true, -- Terminus Cave - Dragon Scale item ball disappeared
     [0x05A0] = true, -- Terminus Cave - TM31 (Brick Break) item ball disappeared
-    [0x05A1] = true, -- Route 20 - Max Revive item ball disappeared
-    [0x05A2] = true, -- Route 20 - HP Up item ball disappeared
-    [0x05A3] = true, -- Route 20 - Rare Bone item ball disappeared
-    [0x05A4] = true, -- Route 20 - PP Up item ball disappeared
-    [0x05A5] = true, -- Route 20 - Toxic Plate item ball disappeared
-    [0x05A6] = true, -- Route 20 - TM36 (Sludge Bomb) item ball disappeared
-    [0x05A7] = true, -- Route 21 - Paralyze Heal item ball disappeared
-    [0x05A8] = true, -- Route 21 - Protein item ball disappeared
-    [0x05A9] = true, -- Route 21 - Meadow Plate item ball disappeared
-    [0x05AA] = true, -- Route 21 - X Accuracy item ball disappeared
-    [0x05AB] = true, -- Route 21 - TM53 (Energy Ball) item ball disappeared
+    [0x05A1] = true, -- Route 19 - Max Revive item ball disappeared
+    [0x05A2] = true, -- Route 19 - HP Up item ball disappeared
+    [0x05A3] = true, -- Route 19 - Rare Bone item ball disappeared
+    [0x05A4] = true, -- Route 19 - PP Up item ball disappeared
+    [0x05A5] = true, -- Route 19 - Toxic Plate item ball disappeared
+    [0x05A6] = true, -- Route 19 - TM36 (Sludge Bomb) item ball disappeared
+    [0x05A7] = true, -- Route 20 - Paralyze Heal item ball disappeared
+    [0x05A8] = true, -- Route 20 - Protein item ball disappeared
+    [0x05A9] = true, -- Route 20 - Meadow Plate item ball disappeared
+    [0x05AA] = true, -- Route 20 - X Accuracy item ball disappeared
+    [0x05AB] = true, -- Route 20 - TM53 (Energy Ball) item ball disappeared
     [0x05AC] = true, -- Pokémon Village - Max Ether item ball disappeared
     [0x05AD] = true, -- Pokémon Village - Full Restore item ball disappeared
     [0x05AE] = true, -- Pokémon Village - Pixie Plate item ball disappeared
@@ -529,15 +613,7 @@ local ITEM_CHECK_FLAGS = {
     [0x05E6] = true, -- Glittering Cave - Escape Rope item ball disappeared
     [0x05E7] = true, -- Parfum Palace - HM01 (Cut) item ball disappeared
     [0x05E8] = true, -- Victory Road - Quick Ball item ball disappeared
-    [0x0A76] = true, -- Coumarine City - Received Diploma for completing Central Kalos Pokédex (native) from Game Director
-    [0x0A77] = true, -- Coumarine City - Received Diploma for completing Coastal Kalos Pokédex (native) from Game Director
-    [0x0A78] = true, -- Coumarine City - Received Diploma for completing Mountain Kalos Pokédex (native) from Game Director
-    [0x0A79] = true, -- Coumarine City - Received Diploma for completing all Kalos Pokédexes (native) from Game Director
-    [0x0A7A] = true, -- Coumarine City - Received Diploma for completing Central Kalos Pokédex from Game Director
-    [0x0A7B] = true, -- Coumarine City - Received Diploma for completing Coastal Kalos Pokédex from Game Director
-    [0x0A7C] = true, -- Coumarine City - Received Diploma for completing Mountain Kalos Pokédex from Game Director
-    [0x0A7D] = true, -- Coumarine City - Received Diploma for completing all Kalos Pokédexes from Game Director
-    [0x0A7E] = true, -- Coumarine City - Received Diploma for completing National Pokédex from Game Director
+    -- 0x0A76-0x0A7E (Pokédex diplomas) removed: require a completed Pokédex.
     [0x0B90] = true, -- Camphrier Town - [Daily] Received Sweet Heart from maid
     [0x0BA5] = true, -- Ambrette Town - [Daily] Exchanged a Poké Ball for a Dive Ball with the punk guy
     [0x0BA6] = true, -- Lumiose City (South Boulevard) - [Daily] Received Rare Candy from male scientist for a chain length of at least 31 Pokémon with the Poké Radar
@@ -557,28 +633,22 @@ local LOCATION_NAMES = {
     [0x0090] = "Cyllage City - Received Whipped Dream / Sachet from man",
     [0x0092] = "Lumiose City (South Boulevard) - Received Luxury Ball (x5) from woman",
     [0x0093] = "Shalour City - Received Shoothe Bell from madame for showing her a Pokémon with good friendship",
-    [0x0097] = "Shalour City - Received Eviolite from scientist for seeing at least 40 species in Coastal Pokédex",
     [0x00A4] = "Aquacorde Town - Received Potion from shopkeeper",
     [0x00AA] = "Coumarine City - Received Poké Toy from woman for answering her sound quiz first time",
-    [0x00B1] = "Lumiose City (South Boulevard) - Received TM54 (False Swipe) from female scientist for seeing at least 20 species in Central Kalos Pokédex",
     [0x00B2] = "Camphrier Town - Received Berry Juice from girl",
     [0x00B3] = "Camphrier Town - Received Ultra Ball from man",
     [0x00B4] = "Camphrier Town - Received Full Heal from boy",
     [0x00B5] = "Camphrier Town - Received TM46 (Thief) from punk girl",
-    [0x00B7] = "Coumarine City - Received Lucky Egg from woman for showing her a Pokémon with maximum friendship",
     [0x00C6] = "Lumiose City (South Boulevard) - Received Quick Claw from woman",
     [0x00C7] = "Lumiose City (South Boulevard) - Received Quick Ball (x3) from man",
-    [0x00D5] = "Ambrette Town - Received the Douse Drive",
     [0x00D7] = "Santalune Forest - Received Poké Ball from Calem/Serena if interacted",
     [0x00FE] = "Lumiose City (South Boulevard) - Received Timer Ball (x3) from man",
     [0x00FF] = "Cyllage City - Received Persim Berry (x3) from girl for answering her quiz",
     [0x0106] = "Parfum Palace - Received Oran Berry from woman",
     [0x0109] = "Ambrette Town - Received TM94 (Rock Smash) from girl",
     [0x010B] = "Santalune City - Received Great Ball from boy",
-    [0x010D] = "Lumiose City (Vernal Avenue) - Received Pearl String (x2) from madame for showing her a Furfrou that has kept the same trim for 15 days",
     [0x010E] = "Tower of Mastery - Received TM47 (Low Sweep) from ace trainer",
     [0x011A] = "Coumarine City - Received Good Rod from fisherman",
-    [0x011C] = "Reflection Cave - Received Reveal Glass from female scientist for showing her a Tornadus / Thundurus / Landorus",
     [0x011D] = "Azure Bay - Received Ampharosite from old man",
     [0x011E] = "Ambrette Town - Received Aerodactylite from male scientist",
     [0x0146] = "Shalour City - Exchanged the Intriguing Stone for a Sun Stone with hiker",
@@ -688,16 +758,16 @@ local LOCATION_NAMES = {
     [0x04A4] = "Frost Cavern - Found Ice Heal (2)",
     [0x04A5] = "Frost Cavern - Found Elixir",
     [0x04A6] = "Frost Cavern - Found PP Up",
-    [0x04A7] = "Route 18 - Found Timer Ball",
-    [0x04A8] = "Route 18 - Found Paralyze Heal",
+    [0x04A7] = "Route 17 - Found Timer Ball",
+    [0x04A8] = "Route 17 - Found Paralyze Heal",
     [0x04A9] = "Anistar City - Found Pretty Wing (recurring)",
     [0x04AA] = "Anistar City - Found Escape Rope",
     [0x04AB] = "Anistar City - Found Super Repel",
     [0x04AC] = "Anistar City - Found Sun Stone",
-    [0x04AD] = "Route 19 - Found Poké Ball",
-    [0x04AE] = "Route 19 - Found Ether",
-    [0x04AF] = "Route 19 - Found Honey",
-    [0x04B0] = "Route 19 - Found Super Potion",
+    [0x04AD] = "Route 18 - Found Poké Ball",
+    [0x04AE] = "Route 18 - Found Ether",
+    [0x04AF] = "Route 18 - Found Honey",
+    [0x04B0] = "Route 18 - Found Super Potion",
     [0x04B1] = "Terminus Cave - Found Dusk Ball",
     [0x04B2] = "Terminus Cave - Found Hyper Potion",
     [0x04B3] = "Terminus Cave - Found Moon Stone",
@@ -711,26 +781,26 @@ local LOCATION_NAMES = {
     [0x04BB] = "Couriway Town - Found Ether",
     [0x04BC] = "Couriway Town - Found Burn Heal",
     [0x04BD] = "Couriway Town - Found Prism Scale (recurring)",
-    [0x04BE] = "Route 20 - Found Net Ball",
-    [0x04BF] = "Route 20 - Found Antidote",
-    [0x04C0] = "Route 20 - Found Damp Rock",
-    [0x04C1] = "Route 20 - Found Escape Rope",
-    [0x04C2] = "Route 20 - Found Timer Ball",
+    [0x04BE] = "Route 19 - Found Net Ball",
+    [0x04BF] = "Route 19 - Found Antidote",
+    [0x04C0] = "Route 19 - Found Damp Rock",
+    [0x04C1] = "Route 19 - Found Escape Rope",
+    [0x04C2] = "Route 19 - Found Timer Ball",
     [0x04C3] = "Snowbelle City - Found Icy Rock",
     [0x04C4] = "Snowbelle City - Found X Sp. Atk",
     [0x04C5] = "Snowbelle City - Found Full Heal",
-    [0x04C6] = "Route 21 - Found Repeat Ball",
-    [0x04C7] = "Route 21 - Found Antidote",
-    [0x04C8] = "Route 21 - Found Mental Herb",
-    [0x04C9] = "Route 21 - Found Tiny Mushroom",
-    [0x04CA] = "Route 21 - Found Balm Mushroom",
+    [0x04C6] = "Route 20 - Found Repeat Ball",
+    [0x04C7] = "Route 20 - Found Antidote",
+    [0x04C8] = "Route 20 - Found Mental Herb",
+    [0x04C9] = "Route 20 - Found Tiny Mushroom",
+    [0x04CA] = "Route 20 - Found Balm Mushroom",
     [0x04CB] = "Pokémon Village - Found Honey",
     [0x04CC] = "Pokémon Village - Found Pretty Wing",
     [0x04CD] = "Pokémon Village - Found Honey (2)",
-    [0x04CE] = "Route 22 - Found Guard Spec.",
-    [0x04CF] = "Route 22 - Found PP Up",
-    [0x04D0] = "Route 22 - Found Pearl String",
-    [0x04D1] = "Route 22 - Found Elixir",
+    [0x04CE] = "Route 21 - Found Guard Spec.",
+    [0x04CF] = "Route 21 - Found PP Up",
+    [0x04D0] = "Route 21 - Found Pearl String",
+    [0x04D1] = "Route 21 - Found Elixir",
     [0x04D2] = "Route 22 - Found Max Elixir",
     [0x04D3] = "Route 22 - Found Full Restore",
     [0x04D4] = "Victory Road - Found X Attack",
@@ -864,13 +934,13 @@ local LOCATION_NAMES = {
     [0x058A] = "Frost Cavern - Ether item ball disappeared",
     [0x058B] = "Frost Cavern - Zinc item ball disappeared",
     [0x058C] = "Frost Cavern - Icy Rock item ball disappeared",
-    [0x058D] = "Route 18 - Icicle Plate item ball disappeared",
-    [0x058E] = "Route 18 - Calcium item ball disappeared",
-    [0x058F] = "Route 18 - Rare Candy item ball disappeared",
-    [0x0590] = "Route 19 - Hyper Potion item ball disappeared",
-    [0x0591] = "Route 19 - PP Up item ball disappeared",
-    [0x0592] = "Route 19 - X Defense item ball disappeared",
-    [0x0593] = "Route 19 - Max Ether item ball disappeared",
+    [0x058D] = "Route 17 - Icicle Plate item ball disappeared",
+    [0x058E] = "Route 17 - Calcium item ball disappeared",
+    [0x058F] = "Route 17 - Rare Candy item ball disappeared",
+    [0x0590] = "Route 18 - Hyper Potion item ball disappeared",
+    [0x0591] = "Route 18 - PP Up item ball disappeared",
+    [0x0592] = "Route 18 - X Defense item ball disappeared",
+    [0x0593] = "Route 18 - Max Ether item ball disappeared",
     [0x0594] = "Terminus Cave - Star Piece item ball disappeared",
     [0x0595] = "Terminus Cave - Heat Rock item ball disappeared",
     [0x0596] = "Terminus Cave - Escape Rope item ball disappeared",
@@ -884,17 +954,17 @@ local LOCATION_NAMES = {
     [0x059E] = "Terminus Cave - Griseous Orb item ball disappeared",
     [0x059F] = "Terminus Cave - Dragon Scale item ball disappeared",
     [0x05A0] = "Terminus Cave - TM31 (Brick Break) item ball disappeared",
-    [0x05A1] = "Route 20 - Max Revive item ball disappeared",
-    [0x05A2] = "Route 20 - HP Up item ball disappeared",
-    [0x05A3] = "Route 20 - Rare Bone item ball disappeared",
-    [0x05A4] = "Route 20 - PP Up item ball disappeared",
-    [0x05A5] = "Route 20 - Toxic Plate item ball disappeared",
-    [0x05A6] = "Route 20 - TM36 (Sludge Bomb) item ball disappeared",
-    [0x05A7] = "Route 21 - Paralyze Heal item ball disappeared",
-    [0x05A8] = "Route 21 - Protein item ball disappeared",
-    [0x05A9] = "Route 21 - Meadow Plate item ball disappeared",
-    [0x05AA] = "Route 21 - X Accuracy item ball disappeared",
-    [0x05AB] = "Route 21 - TM53 (Energy Ball) item ball disappeared",
+    [0x05A1] = "Route 19 - Max Revive item ball disappeared",
+    [0x05A2] = "Route 19 - HP Up item ball disappeared",
+    [0x05A3] = "Route 19 - Rare Bone item ball disappeared",
+    [0x05A4] = "Route 19 - PP Up item ball disappeared",
+    [0x05A5] = "Route 19 - Toxic Plate item ball disappeared",
+    [0x05A6] = "Route 19 - TM36 (Sludge Bomb) item ball disappeared",
+    [0x05A7] = "Route 20 - Paralyze Heal item ball disappeared",
+    [0x05A8] = "Route 20 - Protein item ball disappeared",
+    [0x05A9] = "Route 20 - Meadow Plate item ball disappeared",
+    [0x05AA] = "Route 20 - X Accuracy item ball disappeared",
+    [0x05AB] = "Route 20 - TM53 (Energy Ball) item ball disappeared",
     [0x05AC] = "Pokémon Village - Max Ether item ball disappeared",
     [0x05AD] = "Pokémon Village - Full Restore item ball disappeared",
     [0x05AE] = "Pokémon Village - Pixie Plate item ball disappeared",
@@ -1215,16 +1285,14 @@ local LOCATION_NAMES = {
     [0x08F9] = "Route 20 - Fairy Tale Girl Wynne",
     [0x08FA] = "Route 20 - Hex Maniac Desdemona",
     [0x0927] = "Route 5 - Battled Rising Star Tyson",
+    [0x0012] = "Shabboneau Castle - Received Poké Flute from the castle's owner",
     [0x0A50] = "Pokémon League - Champion Victory",
-    [0x0A76] = "Coumarine City - Received Diploma for completing Central Kalos Pokédex (native) from Game Director",
-    [0x0A77] = "Coumarine City - Received Diploma for completing Coastal Kalos Pokédex (native) from Game Director",
-    [0x0A78] = "Coumarine City - Received Diploma for completing Mountain Kalos Pokédex (native) from Game Director",
-    [0x0A79] = "Coumarine City - Received Diploma for completing all Kalos Pokédexes (native) from Game Director",
-    [0x0A7A] = "Coumarine City - Received Diploma for completing Central Kalos Pokédex from Game Director",
-    [0x0A7B] = "Coumarine City - Received Diploma for completing Coastal Kalos Pokédex from Game Director",
-    [0x0A7C] = "Coumarine City - Received Diploma for completing Mountain Kalos Pokédex from Game Director",
-    [0x0A7D] = "Coumarine City - Received Diploma for completing all Kalos Pokédexes from Game Director",
-    [0x0A7E] = "Coumarine City - Received Diploma for completing National Pokédex from Game Director",
+    [0x0A51] = "Shalour City - Received HM03 (Surf) from Calem/Serena",
+    [0x0A53] = "Cyllage City - Received HM04 (Strength) from Grant",
+    [0x0A55] = "Santalune City - Received Roller Skates from Roller Skater Rinka",
+    [0x0A56] = "Route 19 - Received HM05 (Waterfall) from Shauna",
+    [0x0A57] = "Route 8 - Received the Dowsing Machine from woman",
+    [0x0A58] = "Lysandre Labs - Received the Elevator Key from Mable",
     [0x0B90] = "Camphrier Town - [Daily] Received Sweet Heart from maid",
     [0x0BA5] = "Ambrette Town - [Daily] Exchanged a Poké Ball for a Dive Ball with the punk guy",
     [0x0BA6] = "Lumiose City (South Boulevard) - [Daily] Received Rare Candy from male scientist for a chain length of at least 31 Pokémon with the Poké Radar",
@@ -1242,6 +1310,603 @@ local LOCATION_NAMES = {
 -- Helper to determine if a triggered flag is an actual randomized item pickup location
 local function is_item_check(flag_id)
     return ITEM_CHECK_FLAGS[flag_id] == true
+end
+
+-- ============================================================================
+-- GYM BADGE HELPER
+--
+-- Gym leaders check the badge bitfield to decide whether to battle. In
+-- Archipelago you can receive a badge from another world before beating that
+-- gym, at which point the leader gives post-victory dialogue and the gym's
+-- location check becomes unreachable.
+--
+-- This temporarily clears a single badge bit so the leader will fight again.
+-- Winning makes the game re-award the badge and set the gym event flag itself,
+-- so the Archipelago check fires normally.
+--
+-- It NEVER touches the gym event flags (0x06D2, 0x0718, 0x06E1-0x06E6) --
+-- those ARE the location checks. Only the bitfield at BADGE_ADDRESS is written.
+--
+-- Caveat: badge count drives obedience level and field-move access, so while a
+-- badge is suppressed the obedience cap is one badge lower.
+-- ============================================================================
+
+-- Integer bit masks, written out rather than computed so this stays compatible
+-- with both the Lua 5.1 and Lua 5.4 builds of BizHawk.
+local BADGE_MASK = { [0] = 1, [1] = 2, [2] = 4, [3] = 8,
+                     [4] = 16, [5] = 32, [6] = 64, [7] = 128 }
+
+-- NOTE: bit order is standard gym progression order, matching the badge event
+-- flags above. If a button controls the wrong badge in game, swap the `bit`
+-- values here -- nothing else needs to change.
+local BADGES = {
+    { bit = 0, name = "Bug",     gym = "Santalune / Viola"   },
+    { bit = 1, name = "Cliff",   gym = "Cyllage / Grant"     },
+    { bit = 2, name = "Rumble",  gym = "Shalour / Korrina"   },
+    { bit = 3, name = "Plant",   gym = "Coumarine / Ramos"   },
+    { bit = 4, name = "Voltage", gym = "Lumiose / Clemont"   },
+    { bit = 5, name = "Fairy",   gym = "Laverre / Valerie"   },
+    { bit = 6, name = "Psychic", gym = "Anistar / Olympia"   },
+    { bit = 7, name = "Iceberg", gym = "Snowbelle / Wulfric" },
+}
+
+-- Bits this helper cleared. We only ever restore bits we ourselves took away,
+-- so it can never hand out a badge the player did not legitimately own.
+local badge_suppressed = {}
+local badge_form       = nil
+local badge_buttons    = {}
+local badge_grant_btns = {}
+local badge_header     = nil
+local badge_loadlabel  = nil
+local badge_addrlabel  = nil
+local badge_last_field = -1
+
+-- The address the helper edits. Mutable on purpose: the `addr` command can
+-- retarget it at runtime while hunting for the real badge byte, with no file
+-- edit and no connector restart.
+local badge_addr = BADGE_ADDRESS
+
+-- Value of that byte the instant the connector started, before anything was
+-- written. This is what proves whether the helper changed it or the game did.
+local badge_value_at_load = mainmemory.read_u8(badge_addr)
+
+-- Last value the helper itself wrote, so the watcher can tell "we did this"
+-- apart from "the game or the AP client did this".
+local badge_last_written = nil
+
+local function badge_read_field()
+    return mainmemory.read_u8(badge_addr)
+end
+
+local function badge_is_set(bit)
+    return math.floor(badge_read_field() / BADGE_MASK[bit]) % 2 == 1
+end
+
+local function badge_write_bit(bit, on)
+    local v   = badge_read_field()
+    local cur = math.floor(v / BADGE_MASK[bit]) % 2 == 1
+    if on and not cur then
+        v = v + BADGE_MASK[bit]
+    elseif (not on) and cur then
+        v = v - BADGE_MASK[bit]
+    end
+    mainmemory.write_u8(badge_addr, v)
+    badge_last_written = v
+end
+
+local function badge_bin(v)
+    local s = ""
+    for b = 7, 0, -1 do
+        s = s .. (math.floor(v / BADGE_MASK[b]) % 2)
+    end
+    return s
+end
+
+local function badge_field_binary()
+    return badge_bin(badge_read_field())
+end
+
+local function badge_find(token)
+    local n = tonumber(token)
+    if n and BADGES[n] then return n end
+    if not token then return nil end
+    token = token:lower()
+    for i, b in ipairs(BADGES) do
+        if b.name:lower() == token then return i end
+    end
+    return nil
+end
+
+local function badge_count_suppressed()
+    local n = 0
+    for _ in pairs(badge_suppressed) do n = n + 1 end
+    return n
+end
+
+local function badge_suppress(idx)
+    local b = BADGES[idx]
+    if not badge_is_set(b.bit) then
+        print(string.format(">>> [BADGE] %s Badge is already off -- nothing to do.", b.name))
+        return
+    end
+    badge_write_bit(b.bit, false)
+    badge_suppressed[b.bit] = true
+    print(string.format(">>> [BADGE SUPPRESSED] %s Badge (bit %d) cleared. %s will battle you again.",
+        b.name, b.bit, b.gym))
+    print(">>> Win the gym and the game restores the badge itself. Otherwise press Restore.")
+end
+
+local function badge_restore(idx)
+    local b = BADGES[idx]
+    if not badge_suppressed[b.bit] then
+        print(string.format(">>> [BADGE] Refusing: the helper did not suppress the %s Badge.", b.name))
+        print(string.format(">>>         If you earned it and it is stuck missing, the fallback is:  force on %d", idx))
+        print(">>>         (the \"Grant (cheat)\" button on that row) -- recovery only.")
+        return
+    end
+    badge_write_bit(b.bit, true)
+    badge_suppressed[b.bit] = nil
+    print(string.format(">>> [BADGE RESTORED] %s Badge (bit %d) put back.", b.name, b.bit))
+end
+
+-- CHEAT -- FALLBACK ONLY.
+--
+-- Hands you a badge outright. It does not check whether you earned it, it does
+-- not check whether the helper suppressed it, and it never sets the gym's event
+-- flag -- so it grants the badge's effects WITHOUT awarding the Archipelago
+-- location check for that gym.
+--
+-- It exists purely as a recovery tool for when something has gone wrong: the
+-- connector was reloaded or a save state loaded while a badge was suppressed,
+-- the AP client stripped a badge it should not have, or a badge is otherwise
+-- stuck missing. badge_restore refuses in those cases because it has no record
+-- of taking the badge, which would strand you without this.
+--
+-- Do not use it to skip a gym. Suppress the badge and refight the leader --
+-- that is the supported path, and it awards the check properly.
+local function badge_force_on(idx)
+    local b = BADGES[idx]
+    local before = badge_read_field()
+    badge_write_bit(b.bit, true)
+    badge_suppressed[b.bit] = nil
+    print(string.format(">>> [BADGE CHEAT] Granted %s Badge (bit %d). 0x%08X: %s -> %s",
+        b.name, b.bit, badge_addr, badge_bin(before), badge_field_binary()))
+    print(">>> Fallback for a stuck badge only. This awards NO Archipelago check --")
+    print(">>> only beating the gym leader does that.")
+end
+
+local function badge_restore_all()
+    local n = 0
+    for _, b in ipairs(BADGES) do
+        if badge_suppressed[b.bit] then
+            badge_write_bit(b.bit, true)
+            badge_suppressed[b.bit] = nil
+            n = n + 1
+        end
+    end
+    print(string.format(">>> [BADGE] Restored %d suppressed badge(s).", n))
+end
+
+local function badge_status()
+    local now = badge_read_field()
+    print(string.format("--- Badge bitfield @ 0x%08X = %d (0x%02X) = %s (bit7..bit0) ---",
+        badge_addr, now, now, badge_bin(now)))
+    print(string.format("    Value when the connector loaded: %s", badge_bin(badge_value_at_load)))
+    if now ~= badge_value_at_load then
+        print("    ^ this byte has changed since load.")
+    end
+    for i, b in ipairs(BADGES) do
+        local state
+        if badge_suppressed[b.bit] then
+            state = "SUPPRESSED by helper"
+        elseif badge_is_set(b.bit) then
+            state = "owned"
+        else
+            state = "not owned"
+        end
+        print(string.format("  %d. %-8s Badge  bit %d  [%s]  %s", i, b.name, b.bit, state, b.gym))
+    end
+    print("    If this disagrees with your trainer card, the address is wrong.")
+    print("    Run `dump` and look for a byte matching your real badge count.")
+end
+
+-- Diagnostic: print the bytes around the current address so a wrong
+-- BADGE_ADDRESS can be spotted and corrected without guessing.
+local function badge_dump_region()
+    print(string.format("--- Bytes around 0x%08X ---", badge_addr))
+    for off = -8, 8 do
+        local a = badge_addr + off
+        local v = mainmemory.read_u8(a)
+        print(string.format("  0x%08X  %3d  0x%02X  %s%s",
+            a, v, v, badge_bin(v), (off == 0) and "   <== current badge_addr" or ""))
+    end
+    print("--- End dump ---")
+    print("You want the byte with exactly one bit set per badge you actually own.")
+    print("Retarget with:  addr 0x074D86A4    (then run `status` again)")
+end
+
+-- Point the helper at a different byte without editing the file.
+local function badge_set_addr(token)
+    local n = tonumber(token) or tonumber(token, 16)
+    if not n then
+        print(">>> [BADGE] Could not parse an address from: " .. tostring(token))
+        print(">>>         Try:  addr 0x074D86A4")
+        return
+    end
+    badge_addr = n
+    badge_value_at_load = mainmemory.read_u8(badge_addr)
+    badge_last_written = nil
+    badge_last_field = -1
+    badge_suppressed = {}
+    print(string.format(">>> [BADGE] Now targeting 0x%08X (= %s). Suppression history cleared.",
+        badge_addr, badge_field_binary()))
+    if badge_addrlabel then
+        pcall(forms.settext, badge_addrlabel, string.format("Addr:    0x%08X", badge_addr))
+    end
+    badge_status()
+end
+
+-- Put the byte back exactly as it was when the connector started.
+local function badge_restore_load_value()
+    local before = badge_read_field()
+    mainmemory.write_u8(badge_addr, badge_value_at_load)
+    badge_last_written = badge_value_at_load
+    badge_suppressed = {}
+    print(string.format(">>> [BADGE] 0x%08X reset to its value at load. %s -> %s",
+        badge_addr, badge_bin(before), badge_bin(badge_value_at_load)))
+end
+
+local function badge_command(line)
+    if not line then return end
+    line = line:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if line == "" then return end
+
+    local verb, arg = line:match("^(%S+)%s*(.*)$")
+
+    if verb == "status" or verb == "s" then
+        badge_status()
+    elseif verb == "all" and arg == "on" then
+        badge_restore_all()
+    elseif verb == "off" or verb == "remove" then
+        local idx = badge_find(arg)
+        if idx then badge_suppress(idx)
+        else print(">>> [BADGE] Unknown badge: " .. tostring(arg) .. "  (try: off 2  /  off cliff)") end
+    elseif verb == "on" or verb == "restore" then
+        local idx = badge_find(arg)
+        if idx then badge_restore(idx)
+        else print(">>> [BADGE] Unknown badge: " .. tostring(arg) .. "  (try: on 2  /  on cliff)") end
+    elseif verb == "force" or verb == "grant" then
+        -- accepts "force on 2", "force 2", "grant cliff"
+        local target = arg:gsub("^on%s+", "")
+        local idx = badge_find(target)
+        if idx then badge_force_on(idx)
+        else print(">>> [BADGE] Unknown badge: " .. tostring(target) .. "  (try: force on 2)") end
+    elseif verb == "dump" or verb == "d" then
+        badge_dump_region()
+    elseif verb == "addr" then
+        badge_set_addr(arg)
+    elseif verb == "reset" then
+        badge_restore_load_value()
+    else
+        print(">>> [BADGE] Commands:")
+        print(">>>   off <n|name>       suppress a badge so the leader refights")
+        print(">>>   on <n|name>        restore a badge the helper suppressed")
+        print(">>>   all on             restore everything the helper suppressed")
+        print(">>>   force on <n|name>  CHEAT, fallback only: grants a badge outright.")
+        print(">>>                      Use if a badge is stuck missing. Awards no AP check.")
+        print(">>>   status             print the bitfield and per-badge state")
+        print(">>>   dump               print the bytes around the current address")
+        print(">>>   addr 0x074D86A4    retarget the helper at a different byte")
+        print(">>>   reset              put the byte back to its value at load")
+    end
+end
+
+-- ============================================================================
+-- MANUAL CHECKS FOR ITEMS WITH NO DETECTABLE PICKUP FLAG
+--
+-- Surf, Strength, Waterfall, the Dowsing Machine and the Elevator Key are all
+-- progression items in the multiworld, but the game sets no event flag when you
+-- receive the vanilla copy, so those pickups cannot be detected automatically.
+-- Left alone, the story hands you the item, no check ever fires, and the
+-- matching logic gate is meaningless.
+--
+-- So there is a button you press after you have received one in game. It:
+--   * sets a spare event flag, which the Archipelago client's ordinary flag
+--     scan sees on its next poll and reports as a location check, and
+--   * removes the vanilla copy from your bag -- unless Archipelago had already
+--     granted you that item, in which case the copy you are holding is
+--     legitimately yours and is left alone.
+--
+-- The flags borrowed are five the game itself never touches, listed as
+-- "_UNUSED  /* not used */" in the Gen6_XY event flag reference:
+--     0x0A51  0x0A53  0x0A56  0x0A57  0x0A58
+-- Nothing in the game reads or writes them, so using them cannot disturb a save.
+--
+-- Location checks are permanent server side, so pressing a button twice is
+-- harmless; the second press is ignored.
+-- ============================================================================
+
+local MANUAL_ITEMS = {
+    { name = "HM03 Surf",       item = 422, flag = 0x0A51, pocket = 3, where = "Shalour City"  },
+    { name = "HM04 Strength",   item = 423, flag = 0x0A53, pocket = 3, where = "Cyllage City"  },
+    { name = "HM05 Waterfall",  item = 424, flag = 0x0A56, pocket = 3, where = "Route 19"      },
+    { name = "Dowsing Machine", item = 471, flag = 0x0A57, pocket = 2, where = "Route 8"       },
+    { name = "Elevator Key",    item = 700, flag = 0x0A58, pocket = 2, where = "Lysandre Labs" },
+    -- The Poké Flute has no usable automatic flag either. Its obvious candidate,
+    -- 0x03F5 "Poké Flute obj disappeared", is a field-object visibility flag and
+    -- reads as SET on a brand new save, so it fired a false check the moment a
+    -- client connected. Spare flag 0x0012 is used instead.
+    { name = "Poké Flute",      item = 651, flag = 0x0012, pocket = 2, where = "Shabboneau Castle" },
+}
+
+-- Game item ids Archipelago has written into the bag this session. This is what
+-- tells "you already had this from the multiworld" apart from "you just picked
+-- up the vanilla one".
+local ap_granted_items = {}
+local manual_buttons   = {}
+
+-- Record that Archipelago placed an item into a bag slot. addr may point at the
+-- item id (a fresh slot) or at the quantity (a stack), so round down to the slot
+-- base and read the id back either way.
+note_ap_bag_write = function(addr)
+    for _, p in ipairs(POCKETS) do
+        if addr >= p.addr and addr < (p.addr + p.slots * 4) then
+            local slot = math.floor((addr - p.addr) / 4)
+            local base = p.addr + slot * 4
+            local id   = mainmemory.read_u8(base) + (mainmemory.read_u8(base + 1) * 256)
+            if id > 0 then ap_granted_items[id] = true end
+            return
+        end
+    end
+end
+
+local function event_flag_is_set(flag)
+    local byte = mainmemory.read_u8(EVENT_FLAGS_BASE + math.floor(flag / 8))
+    return math.floor(byte / BADGE_MASK[flag % 8]) % 2 == 1
+end
+
+local function event_flag_set(flag)
+    local addr = EVENT_FLAGS_BASE + math.floor(flag / 8)
+    local byte = mainmemory.read_u8(addr)
+    local mask = BADGE_MASK[flag % 8]
+    if math.floor(byte / mask) % 2 == 0 then
+        mainmemory.write_u8(addr, byte + mask)
+    end
+end
+
+-- Locate an item anywhere in the bag. Returns slot address and quantity, or nil.
+local function bag_find(item_id)
+    for _, p in ipairs(POCKETS) do
+        for s = 0, p.slots - 1 do
+            local a  = p.addr + s * 4
+            local id = mainmemory.read_u8(a) + (mainmemory.read_u8(a + 1) * 256)
+            if id == item_id then
+                return a, mainmemory.read_u8(a + 2) + (mainmemory.read_u8(a + 3) * 256)
+            end
+        end
+    end
+    return nil
+end
+
+local function bag_remove_one(item_id)
+    local a, qty = bag_find(item_id)
+    if not a then return false end
+    if qty <= 1 then
+        mainmemory.write_u8(a, 0)
+        mainmemory.write_u8(a + 1, 0)
+        mainmemory.write_u8(a + 2, 0)
+        mainmemory.write_u8(a + 3, 0)
+    else
+        local left = qty - 1
+        mainmemory.write_u8(a + 2, left % 256)
+        mainmemory.write_u8(a + 3, math.floor(left / 256))
+    end
+    return true
+end
+
+local function bag_grant(entry)
+    local a, qty = bag_find(entry.item)
+    if a then
+        local n = math.min(qty + 1, 999)
+        mainmemory.write_u8(a + 2, n % 256)
+        mainmemory.write_u8(a + 3, math.floor(n / 256))
+        return true
+    end
+    local p = POCKETS[entry.pocket]
+    for s = 0, p.slots - 1 do
+        local slot = p.addr + s * 4
+        local id   = mainmemory.read_u8(slot) + (mainmemory.read_u8(slot + 1) * 256)
+        if id == 0 then
+            mainmemory.write_u8(slot,     entry.item % 256)
+            mainmemory.write_u8(slot + 1, math.floor(entry.item / 256))
+            mainmemory.write_u8(slot + 2, 1)
+            mainmemory.write_u8(slot + 3, 0)
+            return true
+        end
+    end
+    return false
+end
+
+-- "I just picked this up in game."
+local function manual_claim(idx)
+    local e = MANUAL_ITEMS[idx]
+
+    if event_flag_is_set(e.flag) then
+        print(string.format(">>> [MANUAL] %s was already checked -- nothing to do.", e.name))
+        return
+    end
+
+    if ap_granted_items[e.item] then
+        print(string.format(">>> [MANUAL] %s: Archipelago already granted this one, so your copy stays.", e.name))
+    elseif bag_remove_one(e.item) then
+        print(string.format(">>> [MANUAL] %s: vanilla copy removed from your bag.", e.name))
+    else
+        print(string.format(">>> [MANUAL] %s: not found in your bag, so nothing was removed.", e.name))
+        print(">>>          If you do actually have it, use its Cheat button afterwards.")
+    end
+
+    event_flag_set(e.flag)
+    print(string.format(">>> [MANUAL CHECK SENT] %s (%s, flag 0x%04X).", e.name, e.where, e.flag))
+    print(">>>          The Archipelago client will report it on its next poll.")
+end
+
+-- Recovery button: hand the item over regardless, awarding no check.
+local function manual_cheat(idx)
+    local e = MANUAL_ITEMS[idx]
+    if bag_grant(e) then
+        print(string.format(">>> [ITEM CHEAT] Gave you %s. This awards NO Archipelago check.", e.name))
+    else
+        print(string.format(">>> [ITEM CHEAT] Could not place %s -- its bag pocket is full.", e.name))
+    end
+end
+
+-- Build the helper window. Wrapped in pcall so a forms failure on an unusual
+-- BizHawk build can never take the connector down with it.
+local function badge_init_form()
+    local ok, err = pcall(function()
+        badge_form = forms.newform(510, 675, "X/Y Archipelago Helper", function()
+            -- Never leave the player short a badge because they closed the window.
+            badge_restore_all()
+            badge_form = nil
+        end)
+
+        badge_header    = forms.label(badge_form, "Now:     --------", 10, 6, 180, 16)
+        badge_loadlabel = forms.label(badge_form,
+            "At load: " .. badge_bin(badge_value_at_load), 10, 22, 180, 16)
+        badge_addrlabel = forms.label(badge_form,
+            string.format("Addr:    0x%08X", badge_addr), 10, 38, 180, 16)
+
+        -- Column heading over the cheat buttons.
+        forms.label(badge_form, "CHEAT - fallback only", 200, 38, 140, 16)
+
+        for i, b in ipairs(BADGES) do
+            local y = 58 + (i - 1) * 26
+            forms.label(badge_form, string.format("%d. %s", i, b.name), 10, y + 4, 70, 16)
+            badge_buttons[i] = forms.button(badge_form, "...", function()
+                if badge_suppressed[b.bit] then badge_restore(i) else badge_suppress(i) end
+            end, 84, y, 112, 22)
+            -- CHEAT. Grants the badge outright: no earn check, no AP location
+            -- check. Recovery tool for a stuck badge, not a way to skip a gym.
+            badge_grant_btns[i] = forms.button(badge_form, "Grant (cheat)", function()
+                badge_force_on(i)
+            end, 200, y, 88, 22)
+            forms.label(badge_form, b.gym, 294, y + 4, 190, 16)
+        end
+
+        local cy = 58 + #BADGES * 26 + 10
+        forms.label(badge_form, "Command:", 10, cy + 4, 60, 16)
+        local box = forms.textbox(badge_form, "", 190, 20, nil, 74, cy)
+        forms.button(badge_form, "Run", function()
+            badge_command(forms.gettext(box))
+            forms.settext(box, "")
+        end, 272, cy - 1, 44, 22)
+        forms.label(badge_form, "help / dump / addr 0x...", 324, cy + 4, 150, 16)
+
+        forms.button(badge_form, "Restore All",  function() badge_restore_all() end,       10, cy + 30, 105, 24)
+        forms.button(badge_form, "Status",       function() badge_status() end,           120, cy + 30, 105, 24)
+        forms.button(badge_form, "Dump Region",  function() badge_dump_region() end,      230, cy + 30, 105, 24)
+        forms.button(badge_form, "Reset to load", function() badge_restore_load_value() end, 340, cy + 30, 105, 24)
+
+        forms.label(badge_form,
+            "\"Grant (cheat)\" hands you a badge outright. Use it only if a badge is",
+            10, cy + 62, 470, 16)
+        forms.label(badge_form,
+            "stuck missing. It awards no Archipelago check -- beat the leader for that.",
+            10, cy + 78, 470, 16)
+
+        -- Manual checks for the items the game gives no detectable flag for.
+        local my = cy + 106
+        forms.label(badge_form, "Items with no detectable pickup flag:", 10, my, 300, 16)
+        forms.label(badge_form, "Press \"Got it\" after you have received one in game.", 10, my + 16, 400, 16)
+
+        for i, e in ipairs(MANUAL_ITEMS) do
+            local y = my + 38 + (i - 1) * 26
+            forms.label(badge_form, e.name, 10, y + 4, 120, 16)
+            manual_buttons[i] = forms.button(badge_form, "Got it", function()
+                manual_claim(i)
+            end, 134, y, 100, 22)
+            forms.button(badge_form, "Cheat: give", function()
+                manual_cheat(i)
+            end, 240, y, 90, 22)
+            forms.label(badge_form, e.where, 336, y + 4, 150, 16)
+        end
+
+        local wy = my + 38 + #MANUAL_ITEMS * 26 + 4
+        forms.label(badge_form,
+            "\"Got it\" removes the vanilla copy and sends the check. If Archipelago",
+            10, wy, 470, 16)
+        forms.label(badge_form,
+            "already gave you that item, your copy is kept. \"Cheat: give\" only hands",
+            10, wy + 16, 470, 16)
+        forms.label(badge_form,
+            "the item over and sends no check -- for recovery if something goes wrong.",
+            10, wy + 32, 470, 16)
+    end)
+
+    if not ok then
+        badge_form = nil
+        print(">>> [BADGE] Could not create the helper window: " .. tostring(err))
+        print(">>> [BADGE] The connector will keep running without it.")
+    end
+end
+
+-- Per-frame sync: log every change to the byte whoever caused it, notice when
+-- the game hands a suppressed badge back (which is what winning the refight
+-- looks like), and refresh the window.
+local function badge_tick()
+    local field = badge_read_field()
+
+    if field ~= badge_last_field then
+        -- If this fires while you are only walking around, something other than
+        -- the helper is writing this byte -- meaning either the address is wrong
+        -- or the AP client is writing badges here.
+        if badge_last_field >= 0 then
+            local source = (badge_last_written == field) and "helper" or "game / AP client"
+            print(string.format(">>> [BADGE CHANGED] 0x%08X: %s -> %s  (%s, frame %d)",
+                badge_addr, badge_bin(badge_last_field), badge_bin(field),
+                source, emu.framecount()))
+        end
+
+        for _, b in ipairs(BADGES) do
+            if badge_suppressed[b.bit] and math.floor(field / BADGE_MASK[b.bit]) % 2 == 1 then
+                badge_suppressed[b.bit] = nil
+                print(string.format(">>> [BADGE] %s Badge came back on its own -- gym re-won, hold released.", b.name))
+            end
+        end
+
+        badge_last_field = field
+        if badge_form then
+            pcall(forms.settext, badge_header, "Now:     " .. badge_bin(field))
+        end
+    end
+
+    if not badge_form then return end
+
+    for i, b in ipairs(BADGES) do
+        local caption
+        if badge_suppressed[b.bit] then
+            caption = "Restore " .. b.name
+        elseif math.floor(field / BADGE_MASK[b.bit]) % 2 == 1 then
+            caption = "Suppress " .. b.name
+        else
+            caption = "(not owned)"
+        end
+        local got, cur = pcall(forms.gettext, badge_buttons[i])
+        if got and cur ~= caption then
+            pcall(forms.settext, badge_buttons[i], caption)
+        end
+    end
+
+    -- Manual-check buttons: show at a glance which ones have already fired.
+    for i, e in ipairs(MANUAL_ITEMS) do
+        if manual_buttons[i] then
+            local caption = event_flag_is_set(e.flag) and "Checked" or "Got it"
+            local ok, cur = pcall(forms.gettext, manual_buttons[i])
+            if ok and cur ~= caption then
+                pcall(forms.settext, manual_buttons[i], caption)
+            end
+        end
+    end
 end
 
 -- Request Handlers Table matching Archipelago BizHawk Protocol
@@ -1308,6 +1973,10 @@ local request_handlers = {
             local val = (type(raw) == "table") and raw[i] or string.byte(raw, i)
             mainmemory.write_u8(addr + (i - 1), val)
         end
+        -- Remember what Archipelago handed us, so the manual-check buttons can
+        -- tell an AP-granted copy from a vanilla one and avoid deleting the
+        -- wrong item.
+        if is_bag_write then note_ap_bag_write(addr) end
         return {type = "WRITE_RESPONSE"}
     end,
 }
@@ -1328,8 +1997,11 @@ init_server()
 local checked = {}
 local last_bytes = {}
 
-for i = 0, MONITORED_BYTES - 1 do
-    last_bytes[i] = mainmemory.read_u8(EVENT_FLAGS_BASE + i)
+do
+    local blk = read_block(EVENT_FLAGS_BASE, MONITORED_BYTES)
+    for i = 0, MONITORED_BYTES - 1 do
+        last_bytes[i] = blk[i]
+    end
 end
 
 print("==============================================")
@@ -1338,6 +2010,13 @@ print(" Memory Domain: mainmemory")
 print(" Interceptor: AUTO-REMOVE VANILLA ITEMS")
 print(" Status: LISTENING FOR CLIENT ON PORT 43055")
 print("==============================================")
+
+badge_init_form()
+-- Deliberately quiet. Badge state, the bitfield readout and the manual checks
+-- are all visible in the helper window, so dumping them to the console on every
+-- load was just noise. `status`, `dump` and `help` in the window's command box
+-- still print on demand.
+print(">>> [HELPER] Archipelago helper window open. Type `help` in its command box for commands.")
 
 while true do
     -- Full Protocol Non-blocking TCP Socket Server Handling
@@ -1363,7 +2042,17 @@ while true do
                             local req_type = req["type"]
                             local handler = request_handlers[req_type]
                             if handler then
-                                table.insert(responses, handler(req))
+                                -- pcall: a malformed request (e.g. READ with no
+                                -- size, WRITE with no value) would otherwise
+                                -- raise and kill the whole script for the rest
+                                -- of the session, silently ending the run.
+                                local ok, resp = pcall(handler, req)
+                                if ok then
+                                    table.insert(responses, resp)
+                                else
+                                    print(string.format(">>> [HANDLER ERROR] %s: %s", tostring(req_type), tostring(resp)))
+                                    table.insert(responses, {type = "ERROR", err = tostring(resp)})
+                                end
                             else
                                 table.insert(responses, {type = "ERROR", err = "Unknown type: " .. tostring(req_type)})
                             end
@@ -1379,8 +2068,9 @@ while true do
     end
 
     -- Real-Time Event Flag Location Check Monitor
+    local flag_block = read_block(EVENT_FLAGS_BASE, MONITORED_BYTES)
     for i = 0, MONITORED_BYTES - 1 do
-        local cur = mainmemory.read_u8(EVENT_FLAGS_BASE + i)
+        local cur = flag_block[i]
         local prev = last_bytes[i]
         if cur ~= prev then
             for bit = 0, 7 do
@@ -1463,12 +2153,30 @@ while true do
         last_bag = take_bag_snapshot()
     end
 
-    -- On-Screen Status Display
-    gui.drawText(5, 5, "=== Pokémon X/Y Archipelago Connector ===", "yellow", "black", 12)
-    gui.drawText(5, 21, client and "Status: CONNECTED TO CLIENT" or "Status: LISTENING ON PORT 43055", client and "lime" or "yellow", "black", 11)
-    if hold_ap_items then
-        gui.drawText(5, 37, string.format("HOLD: Intercepting Vanilla Item (%d left)...", pending_vanilla_removals), "orange", "black", 11)
+    -- Is the emulator paused?
+    local paused = false
+    if emuclient and emuclient.ispaused then
+        local ok, res = pcall(emuclient.ispaused)
+        paused = (ok and res) or false
     end
 
-    emu.frameadvance()
+    -- Skip the window refresh while paused: nothing can change, and hammering
+    -- the forms API inside a tight yield loop makes BizHawk sluggish.
+    if not paused then
+        badge_tick()
+    end
+
+    -- No on-screen overlay. Connection state, item interception and badge
+    -- suppression are all reported in the Lua Console and the badge window.
+
+    if paused and emu.yield then
+        -- emu.frameadvance() only returns once the emulator advances a frame, so
+        -- on a paused emulator this loop stops dead mid-iteration and the socket
+        -- stops being serviced -- which drops the Archipelago connection the
+        -- moment you pause or alt-tab. Yielding keeps answering the client
+        -- without advancing the game.
+        emu.yield()
+    else
+        emu.frameadvance()
+    end
 end
