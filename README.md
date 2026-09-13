@@ -4,14 +4,14 @@ my implementation for pokemon x/y archipelago
 # Player Installation Steps
 Drop APWorld: Copy pokemon_x_and_y.apworld into %ProgramData%\Archipelago\custom_worlds\ or you should be able to just run it maybe
 
-Put the Pokemon_y_connector/Pokemon_x_connector depend on your game in your Archipelago\data\lua\ folder, might not be necessary but to be safe
+Put the Pokemon_xy_connector depend on your game in your Archipelago\data\lua\ folder, might not be necessary but to be safe
 
 Generate Seed: Use Pokemon X and Y.yaml in the Players/ folder and run ArchipelagoGenerate.exe.
 
 # Play:
 Load Pokémon X or Y in BizHawk.
 
-Run connector_pokemon_y.lua/Pokemon_x_connector, or whatever i called it, in Tools -> Lua Console.
+Run pokemon_xy_connector in Tools -> Lua Console.
 
 Connect using ArchipelagoBizHawkClient.exe.
 
@@ -19,24 +19,27 @@ Added a menu that will pop up when you load the lua script, in this menu there a
 
 1. When you go to fight a gym leader, but you already have their badge, then when you walk up to the leader, hit suppress in the menu and then you can fight them
 
-2. there are some important checks that i couldnt find in the ram (at least not yet) so as a quick fix i added a menu for you to click them off after you collect them, it should remove the original item as well unless archipelago already gave it to you.
+2. there are some important checks that i couldnt find in the ram (at least not yet) so as a quick fix i added a menu for you to click them off after you collect them, it should remove the original item as well unless archipelago already gave it to you. (pokeflute should work now but i left it as a fallback)
 
 3. both sections have cheats incase anything goes wrong, dont cheat, they are just a fall back.
 
 # Known/potential problems:
 
-At the start you may not think it is working, i could not find how to detect any checks before the first youngster austin battle (trainer sanity) or one of the item ball pickups, all of the tutorial stuff i dont think can be messed with (with current knowledge)
+Roadblocks can strand you. Use the roadblock toggle in the helper window if Snorlax respawns behind you.
+
+Three Glittering Cave Team Flare grunts have no location assigned.
+
+Logic has roadblocks behind gyms/other items, some are removed by the game when you complete a quest/beat a gym, for example snorlax is not blocked by having the pokeflute, it is blocked by watching the fireworks, but in logic it is behind the pokeflute
+
+At the start you may not think it is working, i could not find how to detect any checks before the potion the mart guy gives, still working on the story checks as most are weird.
 
 Some items being put in the wrong pockets of bag, can lead to a problem where you have to many items in your first pocket, you would likely need to recieve every single item in the game for this to be a problem and it shouldnt mess with anything essential, but some items might go to the wrong bag, just tell me
 
-likely some locations missing/done incorrectly, tell me if you find one you feel should be a check, right now it should be all field items, the lua console should print out [EVENT FLAG SET] Flag ID: 0x0XXX where those three Xs are something like 25E, when you are reporting a location include that, if there is multiple send me all of them, even if i am checking 10 things for what you want, its better than however many there could possible be
-
-my anti vanilla item pick up is a little bit jank, tell me if you run into an issue with it, i expect it to be extra weird if you try to do an async or if you have to close the game and reconnect, but tell me anything you run into and i will look into it.
-i imagine it might be weird if you have collection upon completion turned on for other games, might work just fine
+likely some locations missing/done incorrectly, tell me if you find one you feel should be a check, right now it should be all field items, 
 
 Some checks that are unreasonable to do mightve slipped through into logic so tell me any you encounter
 
-Game version i imagine shouldnt matter, i believe i have just been using the base US version of Y
+i believe i have just been using the base US version of X/Y, some people have reported issues with other versions so i advise against
 
 Universal Tracker should work, report any problems with it i will try to fix them
 
